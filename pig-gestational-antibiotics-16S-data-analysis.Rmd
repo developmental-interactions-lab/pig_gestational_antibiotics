@@ -1,0 +1,1879 @@
+---
+title: "R Notebook - 16S data analysis in a Gestational Antibiotics study"
+output: html_notebook
+---
+
+R scripts for analysing 16S rRNA gene amplicon sequencing data in a pig gestational antibiotics study.
+
+Preprint:
+Mahmud MR, Orro R, Munsterhjelm C, Pessa-Morikawa T, Ahlqvist T, Junnikkala S, König E, Pujolassos M,  Calle ML,  Kwon HN,  Oliviero C,  Heinonen M, Niku M. Impact of gestational antibiotics on maternal and offspring gut microbiota and growth in pigs. bioRxiv 2025.11.08.687112; doi: https://doi.org/10.1101/2025.11.08.687112
+
+Generative AI (primarily claude.ai Sonnet 4.5) was used to assist in coding. The scripts were validated by humans.
+
+#Prepare packages and install
+
+```{r}
+
+# First time setting up:
+# Latest version of bioconductor
+#if (!require("BiocManager", quietly = TRUE))
+#  install.packages("BiocManager")
+#BiocManager::install(version = "3.22")
+
+# Install phyloseq if needed
+#BiocManager::install("phyloseq")
+
+#Install everything else which is needed
+#BiocManager::install("microbiome/mia")
+#BiocManager::install("microbiome")
+#BiocManager::install("scater")
+#if( !require(ggsignif) ){
+#  install.packages(ggsignif)
+#}
+
+#BiocManager::install("S4Vectors")
+#BiocManager::install("biobakery/maaslin3")
+
+#install.packages("ggpubr")
+#install.packages("devtools")
+#install.packages("tidyverse")
+#install.packages("readxl")
+#install.packages("rmarkdown")
+#install.packages("openxlsx")
+
+# Load general data handling libraries
+library("dplyr")
+library("tidyverse")
+library("tibble") 
+
+# Load general microbiota and statistics libraries
+library("phyloseq")
+library("microbiome")
+library("vegan")
+
+# Load general graphics etc libraries
+library("ggplot2")
+library("RColorBrewer")
+library("patchwork")
+library("ggsignif")
+library("openxlsx")
+library("readxl") 
+library("patchwork") 
+library("ggpubr")
+library("viridis")
+```
+
+#Import data from QIIME2 to R / phyloseq
+
+Start with the QIIME2 output data files (*.qza):
+
+  rooted-tree.qza
+  sample-metadata.tsv
+  table.qza
+  taxonomy.qza  #Here, we used Greengenes2 taxonomy
+
+Use the qiime2R package to directly import as phyloseq, or the manual approach described below.
+  
+##Import directly from QIIME2 data files using qiime2R
+
+```{r}
+# Install if needed
+#devtools::install_github("jbisanz/qiime2R")
+
+library(qiime2R)
+
+# Import directly from QIIME2 artifacts
+physeq <- qza_to_phyloseq(
+  features = "table.qza",           # feature count table
+  tree = "rooted-tree.qza",         # phylogenetic tree (optional)
+  taxonomy = "taxonomy.qza",        # taxonomy
+  metadata = "metadata.txt"         # sample metadata
+)
+
+physeq
+```
+
+Then clean up the taxonomy like explained below for the manual approach - just first extract it from the physeq object and in the end put it back:
+
+```{r}
+# Extract taxonomy table
+tax <- as.data.frame(tax_table(physeq))
+
+# It's already largely cleaned by the package, so
+tax.clean <- tax
+
+#Then process as instructed below, from "Remove taxonomy level indicators"
+
+# And after processing, replace taxonomy table in phyloseq object
+tax_table(physeq) <- tax_table(as.matrix(tax.clean))
+```
+
+##Manual import from QIIME2 data files to phyloseq
+
+For the manual import approach, first use QIIME to export all of these (in the terminal):
+
+  for i in *.qza; do
+  qiime tools export --input-path $i --output-path .
+  done
+  
+Use biom (in terminal) to convert to tsv:
+
+  biom convert -i feature-table.biom -o feature-table.tsv --to-tsv
+  
+You should get these files:
+
+  feature-table.tsv
+  sample-metadata.tsv
+  taxonomy.tsv
+  tree.nwk
+
+Change the first line of taxonomy.tsv (i.e. the header) exactly to this (without ""; using text editor such as nano):
+
+"#OTUID		taxonomy	confidence"
+
+Then use the R code below to build the phyloseq object and clean up the Greengenes2 taxonomy:
+
+```{r}
+#This code is adapted from Yan Hui: https://www.yanh.org/2021/01/01/microbiome-r/
+
+#Read the feature table, taxonomy and metadata
+otu <- read.table(file = "feature-table.tsv",sep = "\t", header = T, row.names = 1,comment.char = "")
+taxonomy <- read.table(file = "taxonomy.tsv", sep = "\t", header = T ,row.names = 1)
+metadata <- read.table(file = "metadata.tsv", sep = "\t", header = T, row.names = 1, dec = ",")
+#metadata<-drop_na(metadata)
+
+# Clean the taxonomy, Greengenes2 format
+tax <- taxonomy %>%
+  dplyr::select(Taxon) %>% 
+  separate(Taxon,c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), ";")
+
+#Remove the taxonomy level indicators
+tax.clean <- data.frame(row.names = row.names(tax),
+                        Kingdom = str_replace(tax[,1], "k__",""),
+                        Phylum = str_replace(tax[,2], "p__",""),
+                        Class = str_replace(tax[,3], "c__",""),
+                        Order = str_replace(tax[,4], "o__",""),
+                        Family = str_replace(tax[,5], "f__",""),
+                        Genus = str_replace(tax[,6], "g__",""),
+                        Species = str_replace(tax[,7], "s__",""),
+                        stringsAsFactors = FALSE)
+
+#Process missing taxonomy data
+tax.clean[is.na(tax.clean)] <- ""
+tax.clean[tax.clean=="__"] <- ""
+
+#Replace missing names with "Unclassified" + higher level taxonomy
+for (i in 1:nrow(tax.clean)){
+  if (tax.clean[i,7] != ""){
+    tax.clean$Species[i] <- paste(tax.clean$Genus[i], tax.clean$Species[i], sep = " ")
+  } else if (tax.clean[i,2] == ""){
+    kingdom <- paste("Unclassified", tax.clean[i,1], sep = " ")
+    tax.clean[i, 2:7] <- kingdom
+  } else if (tax.clean[i,3] == ""){
+    phylum <- paste("Unclassified", tax.clean[i,2], sep = " ")
+    tax.clean[i, 3:7] <- phylum
+  } else if (tax.clean[i,4] == ""){
+    class <- paste("Unclassified", tax.clean[i,3], sep = " ")
+    tax.clean[i, 4:7] <- class
+  } else if (tax.clean[i,5] == ""){
+    order <- paste("Unclassified", tax.clean[i,4], sep = " ")
+    tax.clean[i, 5:7] <- order
+  } else if (tax.clean[i,6] == ""){
+    family <- paste("Unclassified", tax.clean[i,5], sep = " ")
+    tax.clean[i, 6:7] <- family
+  } else if (tax.clean[i,7] == ""){
+    tax.clean$Species[i] <- paste("Unclassified",tax.clean$Genus[i], sep = " ")
+  }
+}
+
+# Then build the phyloseq object
+OTU = otu_table(as.matrix(otu), taxa_are_rows = TRUE)
+TAX = phyloseq::tax_table(as.matrix(tax.clean))
+SAMPLE <- sample_data(metadata)
+TREE = read_tree("tree.nwk")
+
+physeq <- phyloseq(OTU,TAX,SAMPLE,TREE)
+physeq
+
+```
+
+##Export the phyloseq object as RDS for future use (at several taxonomic levels)
+
+```{r}
+# Generate versions for species and genus level analyses:
+ps_species <- tax_glom(phyloseq, taxrank = "Species", NArm = FALSE) # Retain NA taxa
+ps_genus <- tax_glom(phyloseq, taxrank = "Genus", NArm = FALSE) # Retain NA taxa
+
+# If needed, subset to split to several different files
+# For example, using "sample_title" and subsetting for "Piglet feces":
+physeq_pig_feces <- subset_samples(physeq, sample_title == "Piglet feces")
+ps_pig_feces_species <- subset_samples(ps_species, sample_title == "Piglet feces")
+ps_pig_feces_genus <- subset_samples(ps_genus, sample_title == "Piglet feces")
+
+# Save to RDS
+saveRDS(physeq, file="phyloseq_data_ASV.rds")
+saveRDS(ps_species, file="phyloseq_data_SPECIES.rds")
+saveRDS(ps_genus, file="phyloseq_data_GENUS.rds")
+saveRDS(physeq_pig_feces, file="phyloseq_pig_feces_ASV.rds")
+saveRDS(ps_pig_feces_species, file="phyloseq_pig_feces_SPECIES.rds")
+saveRDS(ps_pig_feces_genus, file="phyloseq_pig_feces_GENUS.rds")
+```
+
+# Visualize microbiota compositions using microViz
+
+```{r}
+# Install if needed
+#install.packages(
+#  "microViz",
+#  repos = c(davidbarnett = "https://david-barnett.r-universe.dev", getOption("repos"))
+#)
+
+library(microViz)
+
+# Set some options
+knitr::opts_chunk$set(fig.height = 6, fig.width = 9)
+options(width = 100)
+
+# Load phyloseq object from RDS file if needed
+physeq <- readRDS("phyloseq_pig_feces.rds")
+
+# Just to label output files
+sampletype <- "pig_feces"
+
+# Remove very rare taxa (adjust for your needs), convert to relative abundances and do some cleaning
+ps <- physeq %>%
+  tax_filter(min_prevalence = 2, min_total_abundance = 100) %>%
+  tax_fix() %>%
+  phyloseq_validate() %>%
+  transform_sample_counts(function(x) x / sum(x))
+
+# If needed, convert variables to factors
+# sample_data(ps)$exp_group <- as.factor(sample_data(ps)$exp_group)
+
+#######################
+# To plot every sample 
+#######################
+
+#Genus level plots
+
+# Some settings, adjust for your needs
+ntaxa <- 20
+plot_width <- 7
+plot_height <- 6
+
+# Actual plotting - with some optional settings
+plot_comp <- ps %>%
+  #ps_arrange(sow_parity, target="sample_data") %>%
+  #ps_filter(timepoint == 2) %>%
+  comp_barplot(
+  tax_level = "Genus",
+  #facet_by = "timepoint, exp_group",
+  #sample_order ="asis",
+  merge_other = FALSE, 
+  n_taxa = ntaxa,
+  #bar_outline_colour = NA,
+  label = "sow_parity",)+
+  #label = "sex",)+
+    scale_y_reverse()+
+    labs(y = "relative abundance")+
+  facet_grid(
+  #rows = vars(timepoint),
+    cols = vars(timepoint, exp_group),
+    scales = "free", space = "free" # these options are critically important!
+  )
+
+# Export as PDF
+ggsave(paste("comp_barplot-",sampletype,"-genus-bycomp-outlines.pdf",sep=""), plot = plot_comp, width = plot_width, height = plot_height, device = "pdf")
+
+#Phylum level plots
+
+ntaxa <- 10
+plot_width <- 5
+plot_height <- 6
+
+plot_comp <- ps %>%
+  #ps_arrange(sow_parity, target="sample_data") %>%
+  #ps_filter(timepoint == 2) %>%
+  comp_barplot(
+  tax_level = "Phylum",
+  #facet_by = "timepoint, exp_group",
+  #sample_order ="asis",
+  merge_other = FALSE, 
+  n_taxa = ntaxa,
+  #bar_outline_colour = NA,
+  label = "sow_parity",)+
+  #label = "sex",)+
+    scale_y_reverse()+
+    labs(y = "relative abundance")+
+  facet_grid(
+  #rows = vars(timepoint),
+    cols = vars(timepoint, exp_group),
+    scales = "free", space = "free" # these options are critically important!
+  )
+
+#Export as PDF
+ggsave(paste("comp_barplot-",sampletype,"-phylum-bycomp-outlines.pdf",sep=""), plot = plot_comp, width = plot_width, height = plot_height, device = "pdf")
+
+###############################################
+# Calculate and plot median compositions per sample group
+###############################################
+
+# Genus level
+
+library(stringr)
+
+# Use the filtered phyloseq object with relative abundanced, created above
+
+# Agglomerate taxa at Genus level 
+ps_genus <- tax_glom(ps, taxrank = "Genus", NArm = FALSE) # Retain NA taxa
+
+# Here, we want to group by exp_group AND timepoint; make a new column for this purpose
+sample_data(ps_genus)$combined <- paste(sample_data(ps_genus)$exp_group, sample_data(ps_genus)$timepoint, sep = "_")
+
+# Extract OTU table and convert to data frame for median calculation
+otu_mat_genus <- as(otu_table(ps_genus), "matrix")
+otu_df_genus <- as.data.frame(t(otu_mat_genus)) # Transpose: samples as rows
+otu_df_genus$sample <- rownames(otu_df_genus)
+sample_df_genus <- as.data.frame(as.matrix(sample_data(ps_genus)))
+sample_df_genus$sample <- rownames(sample_df_genus)
+
+# Merge OTU table with combined column from metadata
+otu_with_meta_genus <- otu_df_genus %>%
+  dplyr::left_join(dplyr::select(sample_df_genus, sample, combined), by = "sample")
+
+# Identify taxon columns (exclude sample and combined)
+taxon_cols_genus <- colnames(otu_with_meta_genus)[!colnames(otu_with_meta_genus) %in% c("sample", "combined")]
+
+# Compute median abundances for each taxon by combined group
+otu_merged_genus <- otu_with_meta_genus %>%
+  dplyr::group_by(combined) %>%
+  dplyr::summarise(dplyr::across(dplyr::all_of(taxon_cols_genus), median, na.rm = TRUE)) %>%
+  as.data.frame()
+
+# Check if merged OTU table is non-empty
+if (nrow(otu_merged_genus) == 0 || ncol(otu_merged_genus) <= 1) {
+  stop("Genus-level merged OTU table is empty! Check group definitions or data.")
+}
+
+# Prepare OTU table for phyloseq object
+rownames(otu_merged_genus) <- otu_merged_genus$combined
+otu_merged_genus <- otu_merged_genus[, -1, drop = FALSE]
+otu_table_merged_genus <- otu_table(t(otu_merged_genus), taxa_are_rows = TRUE)
+
+# Create new sample metadata for merged samples
+sample_data_merged_genus <- data.frame(
+  combined = rownames(otu_merged_genus),
+  exp_group = stringr::str_split_i(rownames(otu_merged_genus), "_", 1),
+  timepoint = stringr::str_split_i(rownames(otu_merged_genus), "_", 2)
+)
+rownames(sample_data_merged_genus) <- sample_data_merged_genus$combined
+sample_data_merged_genus <- sample_data(sample_data_merged_genus[, c("exp_group", "timepoint")])
+
+# Create Genus-level phyloseq object
+ps_merged_genus <- phyloseq(otu_table_merged_genus, sample_data_merged_genus, tax_table(ps_genus))
+
+# Phylum level
+
+# Process Phylum-level data: agglomerate, merge by median, and create phyloseq object
+# Agglomerate taxa at Phylum level
+ps_phylum <- tax_glom(ps, taxrank = "Phylum", NArm = FALSE)
+
+# Create combined column for grouping
+sample_data(ps_phylum)$combined <- paste(sample_data(ps_phylum)$exp_group, sample_data(ps_phylum)$timepoint, sep = "_")
+
+# Extract OTU table and convert to data frame
+otu_mat_phylum <- as(otu_table(ps_phylum), "matrix")
+otu_df_phylum <- as.data.frame(t(otu_mat_phylum))
+otu_df_phylum$sample <- rownames(otu_df_phylum)
+sample_df_phylum <- as.data.frame(as.matrix(sample_data(ps_phylum)))
+sample_df_phylum$sample <- rownames(sample_df_phylum)
+
+# Merge OTU table with combined column
+otu_with_meta_phylum <- otu_df_phylum %>%
+  dplyr::left_join(dplyr::select(sample_df_phylum, sample, combined), by = "sample")
+
+# Identify taxon columns
+taxon_cols_phylum <- colnames(otu_with_meta_phylum)[!colnames(otu_with_meta_phylum) %in% c("sample", "combined")]
+
+# Compute median abundances
+otu_merged_phylum <- otu_with_meta_phylum %>%
+  dplyr::group_by(combined) %>%
+  dplyr::summarise(dplyr::across(dplyr::all_of(taxon_cols_phylum), median, na.rm = TRUE)) %>%
+  as.data.frame()
+
+# Check if merged OTU table is non-empty
+if (nrow(otu_merged_phylum) == 0 || ncol(otu_merged_phylum) <= 1) {
+  stop("Phylum-level merged OTU table is empty! Check group definitions or data.")
+}
+
+# Prepare OTU table for phyloseq object
+rownames(otu_merged_phylum) <- otu_merged_phylum$combined
+otu_merged_phylum <- otu_merged_phylum[, -1, drop = FALSE]
+otu_table_merged_phylum <- otu_table(t(otu_merged_phylum), taxa_are_rows = TRUE)
+
+# Create new sample metadata
+sample_data_merged_phylum <- data.frame(
+  combined = rownames(otu_merged_phylum),
+  exp_group = stringr::str_split_i(rownames(otu_merged_phylum), "_", 1),
+  timepoint = stringr::str_split_i(rownames(otu_merged_phylum), "_", 2)
+)
+rownames(sample_data_merged_phylum) <- sample_data_merged_phylum$combined
+sample_data_merged_phylum <- sample_data(sample_data_merged_phylum[, c("exp_group", "timepoint")])
+
+# Create Phylum-level phyloseq object
+ps_merged_phylum <- phyloseq(otu_table_merged_phylum, sample_data_merged_phylum, tax_table(ps_phylum))
+
+# Plot the medians
+# Note that the relative plot "normalizes" automatically!
+
+# Some settings for a genus level plot
+
+ntaxa <- 20
+plot_width <- 6
+plot_height <- 6
+
+plot_comp_merged <- ps_merged_genus %>%
+  comp_barplot(
+  tax_level = "Genus",
+  #facet_by = "timepoint, exp_group",
+sample_order ="asis",
+  merge_other = FALSE, 
+  n_taxa = ntaxa,
+taxa_sums_order = "descending",
+ label = "exp_group")+
+  labs(y = "relative abundance")+
+  scale_y_reverse()+
+facet_grid(
+    #rows = vars(timepoint),
+    cols = vars(timepoint),
+    scales = "free", space = "free" # these options are critically important!
+  )
+
+#Export as PDF
+ggsave(paste("comp_barplot-merged-MEDIANS-",sampletype,"-genus.pdf",sep=""), plot = plot_comp_merged, width = plot_width, height = plot_height, device = "pdf")
+
+# Settings for phylum level plot
+
+ntaxa <- 10
+plot_width <- 5
+plot_height <- 6
+
+plot_comp_merged <- ps_merged_phylum %>%
+
+  comp_barplot(
+  tax_level = "Phylum",
+  #facet_by = "timepoint, exp_group",
+  sample_order ="asis",
+  merge_other = FALSE, 
+  n_taxa = 10,
+  label = "exp_group")+
+  scale_y_reverse()+
+  facet_grid(
+    #rows = vars(timepoint),
+    cols = vars(timepoint),
+    scales = "free", space = "free" # these options are critically important!
+  )
+
+# Export as PDF
+ggsave(paste("comp_barplot-merged-MEDIANS-",sampletype,"-phylum.pdf",sep=""), plot = plot_comp_merged, width = plot_width, height = plot_height, device = "pdf")
+
+```
+
+#Alpha diversity
+
+```{r}
+# Load phyloseq object from RDS file if needed
+physeq <- readRDS("physeq_pig_feces.rds")
+
+# Settings for removing very rare ASVs
+min_reads <- 1
+min_preva <- 0.05 * nsamples(physeq)
+
+# Remove rare ASVs
+ps <- prune_taxa(rowSums(otu_table(physeq) > min_reads) >= min_preva, physeq)
+
+# Use plot_richness() to extract the alpha diversity data (now using only Shannon)
+richness_plot <- plot_richness(ps, x = "exp_group", measures = "Shannon", color = "exp_group")
+
+# Extract data from plot_richness()
+plot_data <- richness_plot$data  # Get the underlying dataframe
+
+# Convert factors (if needed)
+plot_data$exp_group <- as.factor(plot_data$exp_group)
+plot_data$timepoint <- as.factor(plot_data$timepoint)
+
+# Define function to apply statistical tests per timepoint
+stat_tests <- plot_data %>%
+  group_by(timepoint) %>%
+  rstatix::kruskal_test(value ~ exp_group) %>%  # Kruskal-Wallis test
+  rstatix::adjust_pvalue(method = "bonferroni") %>%  # Adjust for multiple comparisons
+  rstatix::add_significance("p.adj")
+
+# Pairwise Wilcoxon test for each timepoint
+pairwise_tests <- plot_data %>%
+  group_by(timepoint) %>%
+  rstatix::pairwise_wilcox_test(value ~ exp_group, p.adjust.method = "bonferroni")
+
+# Create the violin + boxplot visualization
+p <- ggplot(plot_data, aes(x = exp_group, y = value, fill = exp_group)) +
+  geom_violin(trim = FALSE, alpha = 0.5) +  # Violin plot
+  geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.7) +  # Boxplot overlay
+  facet_wrap(~ timepoint) +  # Facet by timepoint
+  stat_compare_means(method = "kruskal.test", label.y = max(plot_data$value) + 0.5) +  # Add Kruskal-Wallis p-value
+  stat_compare_means(comparisons = list(c("C", "P"), c("C", "T"), c("P", "T")), # Experimental group labels in our data
+                     method = "wilcox.test", p.adjust.method = "bonferroni", label = "p.label") +  # Pairwise Wilcoxon
+  theme_minimal() +  # Clean theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +  # Rotate x-axis labels
+  labs(title = "Shannon Diversity Across Groups and Timepoints",
+       x = "Group",
+       y = "Shannon Diversity") +
+  #scale_fill_brewer(palette = "Set2")  # Set color palette
+   scale_fill_manual(values = c("C" = "#785ef0", 
+                                "P" = "#ffb000", 
+                                "T" = "#fe6100"))
+
+# Print the plot
+print(p)
+ggsave("alpha-shannon-ASV-stats.pdf", p, width =5, height = 6)
+```
+
+#Beta diversity
+```{r}
+
+# Load data from RDS if needed; now using species level
+ps <- readRDS("physeq_pig_feces_SPECIES.rds")
+
+# Look at each timepoint (1-3) separately
+for (i in 1:3) {
+    
+ps_time <- subset_samples(ps, timepoint == i)
+
+# Settings for removing very rare taxa 
+min_reads <- 10
+min_preva <- 0.05 * nsamples(ps_time)
+
+# Remove very rare taxa
+ps_time <- prune_taxa(rowSums(otu_table(ps_time) > min_reads) >= min_preva, ps_time)
+
+#Convert to relative abundances!
+ps_time <- transform_sample_counts(ps_time, function(x) x / sum(x))
+
+# Calculate Bray-Curtis distance
+bray_dist <- phyloseq::distance(ps_time, method = "bray")
+write_rds(bray_dist, paste("bray-dist-timepoint-",i,".rds",sep=""))
+
+bray_matrix <- as.matrix(bray_dist)
+
+write.xlsx(bray_matrix, paste("bray-dist-timepoint-",i,".xlsx",sep=""))
+
+# Convert to a matrix
+as.matrix(bray_dist)[1:5, 1:5]  # View the first 5 rows & columns
+
+ord_nmds <- ordinate(ps_time, method = "NMDS", distance = "bray")
+
+# Plot NMDS with experimental groups
+p1 <- plot_ordination(ps_time, ord_nmds, color = "exp_group") +
+  geom_point(size = 4, shape=19) +
+  theme_minimal() +
+  stat_ellipse() +
+  scale_color_manual(values = c("C" = "#785ef0", 
+                                "P" = "#ffb000", 
+                                "T" = "#fe6100"))+
+  ggtitle("NMDS - Bray-Curtis")
+
+
+ord_pcoa <- ordinate(ps_time, method = "PCoA", distance = "bray")
+
+# Plot PCoA
+p2 <- plot_ordination(ps_time, ord_pcoa, color = "exp_group", type="samples") +
+  geom_point(size = 4) +
+  theme_minimal() +
+  stat_ellipse() +
+  scale_color_manual(values = c("C" = "#785ef0", 
+                                "P" = "#ffb000", 
+                                "T" = "#fe6100"))+
+  ggtitle("PCoA - Bray-Curtis") 
+
+# Arrange plots side by side
+combined_plot <- ggarrange(p1, p2, ncol = 2, labels = c("A", "B"))
+
+# Save as PDF
+ggsave(paste("betaDiv-BRAY-timepoint-",i,".pdf",sep=""), combined_plot, width = 10, height = 5)
+
+# PERMANOVA statistics
+
+# Extract sample data
+meta_data <- as.data.frame(as.matrix(sample_data(ps_time)))
+meta_data$exp_group <- as.factor(meta_data$exp_group)
+meta_data$sex <- as.factor(meta_data$sex)
+meta_data$sow_parity <- as.numeric(meta_data$sow_parity)
+meta_data$sow_bcs_4groups <- as.factor(meta_data$sow_bcs_4groups)
+
+# Ensure variables are factors
+meta_data$exp_group <- 
+  factor(meta_data$exp_group)
+meta_data$sex <- 
+  factor(meta_data$sex)
+meta_data$sow_pregnancy_room <- 
+  factor(meta_data$sow_pregnancy_room)
+meta_data$wean_pen_number <- 
+  factor(meta_data$wean_pen_number)
+meta_data$wean_pen <- 
+  factor(meta_data$wean_pen)
+meta_data$sow <- 
+  factor(meta_data$sow)
+meta_data$farrowing_room <- 
+  factor(meta_data$farrowing_room)
+meta_data$sow_parity <- 
+  factor(meta_data$sow_parity)
+meta_data$parity_groups_23_45_68 <- 
+  factor(meta_data$parity_groups_23_45_68)
+
+# Run PERMANOVA
+set.seed(123)  # For reproducibility
+adonis_results <- adonis2(bray_dist ~exp_group+sex+sow_parity+sow_bcs_4groups+sow_pregnancy_room+farrowing_room, data = meta_data, permutations = 999, by="margin")
+
+beta_disp <- betadisper(bray_dist, meta_data$exp_group)
+betadisper_results <- anova(beta_disp)  # Check if dispersion differs significantly
+betadisper_results
+
+# Boxplot of dispersions
+boxplot(beta_disp, main = "Beta Dispersion - Bray-Curtis")
+
+# Output statistics
+
+sink(paste("beta-diversity-bray-timepoint-",i,".txt",sep=""))
+
+cat("### Adonis2 PERMANOVA ###\n")
+print(adonis_results)
+
+cat("### Beta dispersion test ###\n")
+print(betadisper_results)
+
+cat("\n")
+
+sink()
+}
+```
+
+#Microbiota composition change as volatility (Bastiaanssen et al. 2021: https://doi.org/10.1016/j.psyneuen.2020.105047)
+
+```{r}
+# Install and load volatility library
+# devtools::install_github("thomazbastiaanssen/volatility")
+library(volatility)
+
+# Import data at genus level if needed (here, we import the piglet data)
+ps <- readRDS("ps_pig_feces_genus.rds")
+
+# Set a minimum count threshold (e.g., remove taxa with fewer than 10 total reads)
+min_reads <- 10
+min_preva <- 0.05 * nsamples(ps)  # 5% of samples
+
+# Filter taxa with low total counts & prevalence across all samples
+ps_norare <- prune_taxa(rowSums(otu_table(ps) > min_reads) >= min_preva, ps)
+
+# Convert to proper data formats
+OTU_table = as(otu_table(ps_norare), "matrix")
+meta_data = as(sample_data(ps_norare), "data.frame")
+taxonomy =as(tax_table(ps_norare),"matrix")
+
+# Select the samples to be compared manually
+# For example, piglets from timepoint 1 to timepoint 3, by removing timepoint 2 samples:
+
+OTU_table_1_3 <- as.data.frame(OTU_table) %>%
+  dplyr::select(-c(P2_015:P2_261))
+  
+meta_data_1_3 <- as.data.frame(t(meta_data)) %>%
+  dplyr::select(-c(P2_015:P2_261)) %>%
+  t()
+
+vola_genus_table <- as.data.frame(OTU_table_1_3)
+vola_metadata <- as.data.frame(meta_data_1_3)
+
+# Clean up and calculate
+
+#Include only rows with duplicates (= animals with data from two timepoints)
+tdf <- table(vola_metadata$animal_ID)
+vola_metadata <- vola_metadata[vola_metadata$animal_ID %in% names(tdf)[tdf>1],]
+
+# Remove the single samples from genus table manually
+vola_genus_table <-  vola_genus_table %>%
+  select(-c(P1_141,P1_143,P1_016,P1_031,P1_034,P1_035,P3_221))
+
+# CLR transform
+vola_genus_table <- clr_c(vola_genus_table)
+
+# Compute distance
+vola.dist <- dist(t(vola_genus_table))
+vola_out <- get_pairwise_distance(x = vola.dist, metadata = vola_metadata, g = "animal_ID")
+
+# IMPORTANT!! Review vola_out to verify it compared the right samples!!
+
+sink("volatility-piglets-1-to-3-GENUS-clr.txt")
+
+cat("### Volatility, genus level, clr transform after removal of genera with >10 occurrences in at least 5% of samples ###\n")
+
+kruskal.test(dist~exp_group, data = vola_out)
+
+pairwise.wilcox.test(vola_out$dist, vola_out$exp_group,
+                 p.adjust.method = "BH")
+
+sink()
+
+# Generate plot
+
+vola_out %>%
+  
+  # Pipe into ggplot
+  ggplot() +
+  
+  # Define aesthetics
+  aes(x = exp_group, y = dist, fill = exp_group) + 
+  
+  # Define geoms, boxplots overlayed with data points in this case
+  geom_boxplot(alpha = 1/2)+
+  #geom_point(aes(color=sow_parity, alpha=0.8), size=2, alpha=0.8, shape = 19) +
+    geom_point(aes(alpha=0.8), size=2, alpha=0.8, shape = 19) +
+  
+  # Adjust appearance 
+     theme_minimal()+ 
+    scale_fill_manual(values = c("C" = "#785ef0", 
+                                "P" = "#ffb000", 
+                                "T" = "#fe6100"))+
+   scale_color_viridis(option="turbo")+
+  theme_bw() +
+  xlab("") +
+  ylab("Volatility (Aitchison distance)")
+
+
+ggsave(filename=paste("volatility-piglets-1-to-3-GENUS-clr.pdf",sep=""), device="pdf", width=6, height=15, units="cm")
+
+```
+
+#Differential abundances using Maaslin3
+Covariates selected based on beta diversity analyses
+
+```{r}
+########################
+#PIGLETS
+########################
+
+library(maaslin3)
+
+#Download data if needed
+ps <- readRDS("ps_pig_feces_genus.rds")
+
+# TIMEPOINT 3: covariates SEX-PARITY-BCS
+time_point <- "3"
+
+# Select timepoint 3
+pig_select <- subset_samples(ps,timepoint == time_point)
+
+#Prepare metadata
+
+#Export the metadata as dataframe for Maaslin
+meta_data <- data.frame(sample_data(pig_select))
+
+#convert to factors
+meta_data$exp_group <- 
+  factor(meta_data$exp_group, levels = c('C', 'P', 'T'))
+meta_data$sow_bcs <- 
+  factor(meta_data$sow_bcs)
+meta_data$sow_bcs_4groups <- 
+  factor(meta_data$sow_bcs_4groups)
+meta_data$sex <- 
+  factor(meta_data$sex)
+meta_data$sow_pregnancy_room <- 
+  factor(meta_data$sow_pregnancy_room, levels = c('8', '11'))
+meta_data$wean_pen_number <- 
+  factor(meta_data$wean_pen_number)
+meta_data$wean_pen <- 
+  factor(meta_data$wean_pen)
+meta_data$sow <- 
+  factor(meta_data$sow)
+meta_data$farrowing_room <- 
+  factor(meta_data$farrowing_room)
+meta_data$sow_parity <- 
+  factor(meta_data$sow_parity)
+meta_data$parity_groups_23_45_68 <- 
+  factor(meta_data$parity_groups_23_45_68)
+
+#Find out the smallest exp_group in this subset:
+smallest_group <- min(table(meta_data$exp_group))
+
+#Set minimum prevalence at 80% of the size of the smallest exp_group
+min_preva <- 0.8*smallest_group/nsamples(pig_select)
+
+#Set output folder name
+output_folder <- paste("maaslin3-piglets-",time_point,sep="") 
+
+# Fit models 
+fit_out <- maaslin3(input_data = data.frame(otu_table(pig_select)),
+                    input_metadata = meta_data,
+                    output =  output_folder,
+                    formula = '~exp_group+sex+sow_parity+sow_bcs_4groups+reads',
+                    min_abundance = 0.05,
+                    min_prevalence = 0.1,
+                    augment = TRUE,
+                    standardize = TRUE,
+                    #The relaxed significance threshold just for plotting everything!
+                    max_significance = 1.0,
+                    median_comparison_abundance = FALSE,
+                    median_comparison_prevalence = FALSE,
+                    max_pngs = 300,
+                    cores = 8,
+                    save_models = TRUE)
+                    
+#TIMEPOINT 2: covariates PARITY-BCS-PREGNANCY ROOM-FARROWING ROOM
+time_point <- "2"
+
+# Select timepoint
+pig_select <- subset_samples(ps,timepoint == time_point)
+
+# Prepare metadata
+
+# Export the metadata as dataframe for Maaslin
+meta_data <- data.frame(sample_data(pig_select))
+ 
+# Convert to factors 
+meta_data$exp_group <- 
+  factor(meta_data$exp_group, levels = c('C', 'P', 'T'))
+meta_data$sow_bcs <- 
+  factor(meta_data$sow_bcs)
+meta_data$sow_bcs_4groups <- 
+  factor(meta_data$sow_bcs_4groups)
+meta_data$sex <- 
+  factor(meta_data$sex)
+meta_data$sow_pregnancy_room <- 
+  factor(meta_data$sow_pregnancy_room, levels = c('8', '11'))
+meta_data$wean_pen_number <- 
+  factor(meta_data$wean_pen_number)
+meta_data$wean_pen <- 
+  factor(meta_data$wean_pen)
+meta_data$sow <- 
+  factor(meta_data$sow)
+meta_data$farrowing_room <- 
+  factor(meta_data$farrowing_room)
+meta_data$sow_parity <- 
+  factor(meta_data$sow_parity)
+meta_data$parity_groups_23_45_68 <- 
+  factor(meta_data$parity_groups_23_45_68)
+
+#Find out the smallest exp_group in this subset:
+smallest_group <- min(table(meta_data$exp_group))
+
+#Set minimum prevalence at 80% of the size of the smallest exp_group
+min_preva <- 0.8*smallest_group/nsamples(pig_select)
+
+#Set output folder name
+
+output_folder <- paste("maaslin3-pig",time_point,sep="")
+ 
+# Fit models 
+fit_out <- maaslin3(input_data = data.frame(otu_table(pig_select)),
+                    input_metadata = meta_data,
+                    output =  output_folder,
+                    formula = '~exp_group+sow_parity+sow_bcs_4groups+sow_pregnancy_room+farrowing_room+reads',
+                    min_abundance = 0.01,
+                    min_prevalence = min_preva,
+                    augment = TRUE,
+                    standardize = TRUE,
+                    #The relaxed significance threshold just for plotting everything!
+                    max_significance = 0.2,
+                    median_comparison_abundance = FALSE,
+                    median_comparison_prevalence = FALSE,
+                    max_pngs = 300,
+                    cores = 8,
+                    save_models = TRUE)
+
+#TIMEPOINT 1: Covariatges PARITY-BCS-PREGNANCY ROOM-FARROWING ROOM
+time_point <- "1"
+
+# Select timepoint
+pig_select <- subset_samples(ps,timepoint == time_point)
+
+#Prepare metadata
+
+# Export the metadata as dataframe for Maaslin
+meta_data <- data.frame(sample_data(pig_select))
+ 
+# Convert to factors 
+meta_data$exp_group <- 
+  factor(meta_data$exp_group, levels = c('C', 'P', 'T'))
+meta_data$sow_bcs <- 
+  factor(meta_data$sow_bcs)
+meta_data$sow_bcs_4groups <- 
+  factor(meta_data$sow_bcs_4groups)
+meta_data$sex <- 
+  factor(meta_data$sex)
+meta_data$sow_pregnancy_room <- 
+  factor(meta_data$sow_pregnancy_room, levels = c('8', '11'))
+meta_data$wean_pen_number <- 
+  factor(meta_data$wean_pen_number)
+meta_data$wean_pen <- 
+  factor(meta_data$wean_pen)
+meta_data$sow <- 
+  factor(meta_data$sow)
+meta_data$farrowing_room <- 
+  factor(meta_data$farrowing_room)
+meta_data$sow_parity <- 
+  factor(meta_data$sow_parity)
+meta_data$parity_groups_23_45_68 <- 
+  factor(meta_data$parity_groups_23_45_68)
+
+#Find out the smallest exp_group in this subset:
+smallest_group <- min(table(meta_data$exp_group))
+
+#Set minimum prevalence at 80% of the size of the smallest exp_group
+min_preva <- 0.8*smallest_group/nsamples(pig_select)
+
+#Set output folder name
+
+output_folder <- paste("maaslin3-pig",time_point,sep="")
+ 
+# Fit models 
+fit_out <- maaslin3(input_data = data.frame(otu_table(pig_select)),
+                    input_metadata = meta_data,
+                    output =  output_folder,
+                    formula = '~exp_group+sow_parity+sow_bcs_4groups+sow_pregnancy_room+farrowing_room+reads',
+                    min_abundance = 0.01,
+                    min_prevalence = min_preva,
+                    augment = TRUE,
+                    standardize = TRUE,
+                    #The relaxed threshold just for plotting
+                    max_significance = 0.2,
+                    median_comparison_abundance = FALSE,
+                    median_comparison_prevalence = FALSE,
+                    max_pngs = 300,
+                    cores = 8,
+                    save_models = TRUE)
+                    
+####################
+# SOWS
+####################
+
+#Download data if needed
+
+sampletype <- "sow_fecal"
+ps <- readRDS("ps_sow_feces_GENUS.rds")
+
+#Timepoint by timepoint
+
+for (time_point in 1:2) {
+   
+time_point <- "2"
+
+# Select timepoint
+
+pig_select <- subset_samples(ps,timepoint == time_point)
+
+ 
+# Export the metadata as dataframe for Maaslin
+meta_data <- data.frame(sample_data(pig_select))
+
+# Convert to factors 
+meta_data$exp_group <- 
+  factor(meta_data$exp_group, levels = c('C', 'P', 'T'))
+meta_data$sow_bcs <- 
+  factor(meta_data$sow_bcs)
+meta_data$sow_pregnancy_room <- 
+  factor(meta_data$sow_pregnancy_room, levels = c('8', '11'))
+meta_data$sow <- 
+  factor(meta_data$sow)
+meta_data$sow_parity <- 
+  factor(meta_data$sow_parity)
+  
+meta_data$parity_groups_23_45_68 <- 
+  factor(meta_data$parity_groups_23_45_68)
+
+meta_data$sow_bcs_4groups <- 
+  factor(meta_data$sow_bcs_4groups)
+  
+#Find out the smallest exp_group in this subset:
+smallest_group <- min(table(meta_data$exp_group))
+
+#Set minimum prevalence at 80% of the size of the smallest exp_group
+min_preva <- 0.8*smallest_group/nsamples(pig_select)
+
+#Set output filenames
+
+#For feces:
+output_folder <- paste("maaslin3-",sampletype,"-tp",time_point,sep="")
+
+meta_data <- as.data.frame(meta_data)
+ 
+# Fit models 
+
+fit_out <- maaslin3(input_data = data.frame(otu_table(pig_select)),
+                    input_metadata = as.data.frame(meta_data),
+                    output =  output_folder,
+                    formula = '~exp_group+sow_parity+reads',
+                    min_abundance = 0.001,
+                    min_prevalence = min_preva,
+                    augment = TRUE,
+                    standardize = TRUE,
+                    max_significance = 0.2,
+                    median_comparison_abundance = FALSE,
+                    median_comparison_prevalence = FALSE,
+                    max_pngs = 300,
+                    cores = 8,
+                    save_models = TRUE)
+
+}
+    
+```
+#Phylum level ratios
+
+```{r}
+# Load necessary packages
+library(phyloseq)
+library(microbiome)   # For CLR transformation
+library(ggplot2)
+library(dplyr)
+library(rstatix)      # For pairwise comparisons
+library(writexl)      # For exporting to Excel
+
+physeq <- readRDS("physeq_pig_feces.rds")
+
+# Aggregate to phylum level
+physeq_phylum <- tax_glom(physeq, taxrank = "Phylum")
+
+# Perform CLR transformation using microbiome package
+physeq_clr <- transform(physeq_phylum, "clr")
+
+# Extract OTU table, taxonomy table, and metadata
+otu_table_df <- as.data.frame(otu_table(physeq_clr))  # Make sure it's a data frame
+tax_table_df <- as.data.frame(tax_table(physeq_clr))  # Taxonomy table
+meta_df <- as.data.frame(sample_data(physeq_clr))     # Metadata
+
+# Ensure OTU table has samples as rows (phyloseq stores them as columns by default)
+otu_table_df <- t(otu_table_df)  # Transpose so that samples are rows
+
+# Ensure row names of OTU table match the row names of metadata
+rownames(otu_table_df) <- rownames(meta_df)
+
+# Get the sum of any Firmicutes + Actinobacteriota for each sample
+firmicutes_phyla <- grep("^Firmicutes", tax_table_df$Phylum, value = TRUE)
+selected_phyla <- c(firmicutes_phyla, "Actinobacteriota")
+group_1 <- rowSums(otu_table_df[, tax_table_df$Phylum %in% selected_phyla, drop = FALSE])
+
+# Get the sum of Bacteroidota + Proteobacteria for each sample
+group_2 <- rowSums(otu_table_df[, tax_table_df$Phylum %in% c("Bacteroidota", "Proteobacteria"), drop = FALSE])
+
+# Ensure lengths match before adding to metadata
+if (length(group_1) == nrow(meta_df) & length(group_2) == nrow(meta_df)) {
+  meta_df$ratio <- group_1 / group_2
+} else {
+  stop("Error: Mismatch in number of samples between OTU table and metadata!")
+}
+
+# Create boxplot
+p <- ggplot(meta_df, aes(x = exp_group, y = ratio, fill = exp_group)) +
+  geom_boxplot() +
+  facet_wrap(~timepoint, scales = "free") +
+  theme_minimal() +
+  labs(title = "Phylum ratio",
+       x = "Experimental group",
+       y = "Firmicutes/Actinobacteriota vs Bacteroidota/Proteobacteria ratio") +
+  theme(legend.position = "none")
+
+# Save plot as PDF
+ggsave("phylum_ratio_boxplot.pdf", p, width = 8, height = 6)
+
+# Perform Kruskal-Wallis test for each timepoint
+kruskal_results <- meta_df %>%
+  group_by(timepoint) %>%
+  summarise(
+    p_value = list(kruskal.test(ratio ~ exp_group)$p.value)
+  ) %>%
+  unnest(cols = c(p_value))
+
+# Perform pairwise test for each timepoint
+wilcox_results <- meta_df %>%
+  group_by(timepoint) %>%
+  pairwise_wilcox_test(ratio ~ exp_group, p.adjust.method = "bonferroni")
+
+# Save all statistical results to a single Excel file
+write_xlsx(
+  list(
+    Kruskal_Wallis = kruskal_results,
+    Wilcoxon_Pairwise = wilcox_results
+  ),
+  "phylum_ratio_statistics.xlsx"
+)
+
+
+```
+#LMER analysis
+```{r}
+### Piglet fecal Microbiota
+# --- Libraries ---
+library(phyloseq)
+library(microbiome)
+library(dplyr)
+library(tidyr)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(ggplot2)
+library(patchwork)
+library(readr)
+library(RColorBrewer)
+library(car)  # fallback for Type III ANOVA
+
+# ---------- User parameters ----------
+rds_path <- "ps_pig_feces_genus.rds"
+prevalence_threshold <- 0.25  # keep genera present in >=25% samples and mean abundance >=0.001
+min_non_na <- 6
+ddf_try_order <- c("Kenward-Roger", "Satterthwaite")
+fdr_cutoff <- 0.05
+
+# --- Helper utils ---
+get_interaction_p_from_anova <- function(anova_obj, pattern = "exp_group:timepoint") {
+  if (is.null(anova_obj)) return(NA_real_)
+  rn <- rownames(anova_obj)
+  ridx <- grep(pattern, rn, ignore.case = TRUE)
+  if (length(ridx) == 0) return(NA_real_)
+  cn <- colnames(anova_obj)
+  pcol <- cn[grepl("Pr\\(|Pr\\(>F\\)|p.value|p_value|pval", cn, ignore.case = TRUE)][1]
+  if (is.na(pcol) || is.null(pcol)) {
+    numcols <- which(sapply(anova_obj, is.numeric))
+    if (length(numcols) == 0) return(NA_real_)
+    pcol <- colnames(anova_obj)[numcols[1]]
+  }
+  as.numeric(anova_obj[ridx[1], pcol])
+}
+
+find_p_col <- function(df) {
+  cn <- colnames(df)
+  pcol <- cn[grepl("^p.value$|^p_value$|^pval$|^p$|^p\\.value$", cn, ignore.case = TRUE)]
+  if (length(pcol) == 0) return(NULL)
+  pcol[1]
+}
+
+# --- Step 1: Load data + preprocessing ---
+ps <- readRDS(rds_path)
+message("Loaded RDS: ", rds_path)
+
+# --- Apply only second filter (prevalence >=25% and mean abundance >=0.001) ---
+ps_filtered <- ps %>%
+  filter_taxa(function(x){
+    prevalence <- sum(x>0)/length(x)
+    mean_abundance <- mean(x/sum(x))
+    prevalence >= 0.25 & mean_abundance >= 0.001
+  }, prune = TRUE)
+message("After filter_taxa -> taxa:", ntaxa(ps_filtered), " samples:", nsamples(ps_filtered))
+
+# --- Transform to relative abundance ---
+ps_rel <- microbiome::transform(ps_filtered, "compositional")
+
+# --- Extract OTU and metadata ---
+otu <- as.data.frame(t(otu_table(ps_rel)))
+meta_data <- as(sample_data(ps_rel), "data.frame") %>%
+  filter(!is.na(exp_group), !is.na(timepoint), !is.na(animal_ID)) %>%
+  mutate(
+    exp_group = factor(exp_group, levels=c("C","P","T")),
+    timepoint = factor(timepoint, levels=c("1","2","3"), ordered=TRUE),
+    parity_groups_23_45_68 = as.factor(parity_groups_23_45_68),
+    sow_pregnancy_room = as.factor(sow_pregnancy_room),
+    sow_bcs = as.factor(sow_bcs),
+    animal_ID = factor(animal_ID)
+  )
+
+# Align OTU rows to metadata
+otu <- otu[rownames(meta_data), ]
+message("Samples after metadata filter: ", nrow(meta_data))
+message("Genera available (columns in otu): ", ncol(otu))
+
+# ---------- Step 2: Core LMER loop ----------
+run_lmer_all_groups <- function(otu_df, meta_df, apply_fdr = TRUE, ddf_try_order = c("Kenward-Roger","Satterthwaite")) {
+  ddf_try_order <- match.arg(ddf_try_order, several.ok = TRUE)
+  genera <- colnames(otu_df)
+  message("Testing ", length(genera), " genera ...")
+  
+  # Storage
+  pred_rows <- list()     # predicted means
+  cross_rows <- list()    # cross-sectional contrasts
+  genus_pvals <- list()   # genus-level interaction p-values
+  skipped <- list()
+  
+  for (g in genera) {
+    df <- data.frame(
+      Abundance = otu_df[[g]],
+      exp_group = meta_df$exp_group,
+      timepoint = meta_df$timepoint,
+      parity_groups_23_45_68 = meta_df$parity_groups_23_45_68,
+      sow_pregnancy_room = meta_df$sow_pregnancy_room,
+      sow_bcs = meta_df$sow_bcs,
+      animal_ID = meta_df$animal_ID,
+      stringsAsFactors = FALSE
+    )
+    
+    # Defensive checks
+    if (sum(!is.na(df$Abundance)) < 6) { skipped[[g]] <- "too_few_nonNA"; next }
+    if (length(unique(df$exp_group[!is.na(df$Abundance)])) < 2) { skipped[[g]] <- "not_enough_groups"; next }
+    if (length(unique(df$timepoint[!is.na(df$Abundance)])) < 2) { skipped[[g]] <- "not_enough_timepoints"; next }
+    if (length(unique(df$animal_ID[!is.na(df$Abundance)])) < 2) { skipped[[g]] <- "not_enough_animals"; next }
+    if (var(df$Abundance, na.rm = TRUE) == 0) { skipped[[g]] <- "zero_variance"; next }
+    
+    # Fit LMER
+    fit <- tryCatch({
+      lmer(Abundance ~ exp_group * timepoint +
+             parity_groups_23_45_68 + sow_pregnancy_room + sow_bcs +
+             (1 | animal_ID),
+           data = df,
+           REML = TRUE,
+           control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5)))
+    }, error = function(e) e)
+    if (inherits(fit, "error")) { skipped[[g]] <- paste0("model_error: ", fit$message); next }
+    
+    # Predicted means
+    emm_pred <- tryCatch(emmeans(fit, ~ exp_group * timepoint), error = function(e) e)
+    if (inherits(emm_pred, "error")) { skipped[[g]] <- paste0("emmeans_error: ", emm_pred$message); next }
+    pred_df <- as.data.frame(emm_pred) %>%
+      dplyr::rename(estimate = emmean, SE = SE) %>%
+      dplyr::mutate(Genus = g, contrast = paste(exp_group, timepoint, sep = " | "))
+    
+    # ANOVA for interaction p-value
+    p_interaction <- NA_real_
+    anova_ok <- FALSE
+    for (ddf_method in ddf_try_order) {
+      a_try <- tryCatch(lmerTest::anova(fit, type = 3, ddf = ddf_method), error = function(e) NULL)
+      if (!is.null(a_try)) {
+        p_try <- get_interaction_p_from_anova(a_try, pattern = "exp_group:timepoint")
+        if (!is.na(p_try)) { p_interaction <- p_try; anova_ok <- TRUE; break }
+      }
+    }
+    if (!anova_ok) {
+      a2 <- tryCatch(car::Anova(fit, type = "III"), error = function(e) NULL)
+      if (!is.null(a2)) {
+        p_try <- get_interaction_p_from_anova(a2, pattern = "exp_group:timepoint")
+        if (!is.na(p_try)) { p_interaction <- p_try; anova_ok <- TRUE }
+      }
+    }
+    if (!anova_ok) { skipped[[g]] <- "anova_failed"; next }
+    
+    # Save predicted table + p
+    pred_df <- pred_df %>% dplyr::mutate(interaction_p = p_interaction)
+    pred_rows[[g]] <- pred_df
+    genus_pvals[[g]] <- p_interaction
+    
+    # Cross-sectional contrasts
+    cross_contr <- tryCatch({
+      emm_by_time <- emmeans(fit, ~ exp_group | timepoint)
+      my_contr <- contrast(emm_by_time,
+                           method = list("P_vs_C" = c(-1, 1, 0),
+                                         "T_vs_C" = c(-1, 0, 1)),
+                           adjust = "none")
+      as.data.frame(summary(my_contr, infer = TRUE)) %>% dplyr::mutate(Genus = g)
+    }, error = function(e) NULL)
+    
+    if (!is.null(cross_contr) && nrow(cross_contr) > 0) cross_rows[[g]] <- cross_contr
+  }
+  
+  # Combine results
+  results_pred <- dplyr::bind_rows(pred_rows)
+  results_cross <- dplyr::bind_rows(cross_rows)
+  
+  # Genus-level FDR
+  genus_level <- tibble::tibble(Genus = names(genus_pvals), interaction_p = as.numeric(unlist(genus_pvals)))
+  if (nrow(genus_level) > 0 && apply_fdr) {
+    genus_level <- genus_level %>% dplyr::mutate(interaction_fdr = p.adjust(interaction_p, method = "BH"),
+                                                 Significant = !is.na(interaction_fdr) & interaction_fdr < 0.05)
+  } else {
+    genus_level <- genus_level %>% dplyr::mutate(interaction_fdr = NA_real_, Significant = FALSE)
+  }
+  
+  # Attach FDR to predicted rows safely
+  if (nrow(results_pred) > 0) {
+    results_pred <- results_pred %>%
+      dplyr::left_join(genus_level %>% dplyr::select(Genus, interaction_fdr, Significant), by = "Genus")
+    
+    cols_to_keep <- c("Genus", "exp_group", "timepoint", "estimate", "SE", "df",
+                      "contrast", "interaction_p", "interaction_fdr", "Significant")
+    existing_cols <- cols_to_keep[cols_to_keep %in% colnames(results_pred)]
+    results_pred <- results_pred %>% dplyr::select(all_of(existing_cols))
+  }
+  
+  # Process cross-sectional contrasts: FDR across contrasts
+  if (nrow(results_cross) > 0) {
+    pcol <- find_p_col(results_cross)
+    if (!is.null(pcol)) {
+      results_cross <- results_cross %>%
+        dplyr::mutate(p_value = as.numeric(.data[[pcol]])) %>%
+        dplyr::mutate(Contrast_FDR = if (apply_fdr) p.adjust(p_value, method = "BH") else p_value)
+    } else {
+      message("Warning: no p-value column found in cross-sectional contrasts.")
+    }
+  }
+  
+  # Save cross-sectional CSV
+  if (nrow(results_cross) > 0) {
+    readr::write_csv(results_cross, "LMER_piglets-cross_sectional_contrasts.csv")
+    message("Saved LMER_piglets-cross_sectional_contrasts.csv")
+  }
+  
+  # Summary messages
+  message("Genera tested: ", length(genera))
+  if (length(skipped) > 0) {
+    skip_tbl <- table(unlist(skipped))
+    message("Skipped genera summary (reason:count):")
+    print(as.data.frame(skip_tbl))
+  }
+  message("Genera with LMER results (rows in predicted table): ", length(unique(results_pred$Genus)))
+  message("Cross-sectional contrast rows: ", nrow(results_cross))
+  
+  list(predicted = results_pred, cross = results_cross, genus_level = genus_level)
+}
+
+
+# --- Step 3: Run analysis ---
+res_all <- run_lmer_all_groups(otu_df = otu, meta_df = meta_data,
+                               apply_fdr=TRUE, ddf_try_order=ddf_try_order)
+
+# --- Step 4: Save CSVs ---
+if (!is.null(res_all$predicted) && nrow(res_all$predicted)>0) write_csv(res_all$predicted,"lmer_piglets-longitudinal_results.csv")
+if (!is.null(res_all$cross) && nrow(res_all$cross)>0) write_csv(res_all$cross,"lmer_piglets-cross_sectional_contrasts.csv")
+if (!is.null(res_all$genus_level) && nrow(res_all$genus_level)>0) write_csv(res_all$genus_level,"lmer_piglets-longitudinal_genuslevel.csv")
+
+# --- Step 5: Plotting longitudinal results for significant genera ---
+if (!is.null(res_all$predicted) && nrow(res_all$predicted) > 0) {
+  sig_genera <- res_all$genus_level %>%
+    dplyr::filter(Significant) %>%
+    dplyr::pull(Genus)
+  
+  if (length(sig_genera) > 0) {
+    plots <- list()
+    for (g in sig_genera) {
+      df_pred <- res_all$predicted %>% dplyr::filter(Genus == g)
+      if (nrow(df_pred) == 0) next
+      
+      df_pred <- df_pred %>% dplyr::mutate(timepoint = factor(timepoint, levels = levels(meta_data$timepoint)))
+      title_text <- ifelse(unique(df_pred$Significant), paste0(g, " *"), g)
+      fdr_val <- unique(df_pred$interaction_fdr)
+      fdr_label <- ifelse(is.na(fdr_val), "", paste0("FDR (interaction)=", signif(fdr_val, 3)))
+      
+      p <- ggplot(df_pred, aes(x = timepoint, y = estimate, color = exp_group, group = exp_group)) +
+        geom_point(size = 3, position = position_dodge(width = 0.25)) +
+        geom_line(position = position_dodge(width = 0.25), size = 1) +
+        geom_errorbar(aes(ymin = estimate - SE, ymax = estimate + SE),
+                      width = 0.15, position = position_dodge(width = 0.25)) +
+        scale_color_brewer(palette = "Set2") +
+        labs(title = title_text, y = "Predicted relative abundance (emmean ± SE)", x = "Timepoint") +
+        annotate("text", x = 1, y = max(df_pred$estimate + df_pred$SE, na.rm = TRUE) * 1.03,
+                 label = fdr_label, hjust = 0, size = 4, fontface = "italic") +
+        theme_bw() +
+        theme(plot.title = element_text(face = "bold", hjust = 0.5),
+              legend.position = "bottom")
+      plots[[g]] <- p
+    }
+    
+    # --- Save multi-page PDF with 6 plots per page ---
+    total_plots <- length(plots)
+    pages <- ceiling(total_plots / 6)
+    
+    pdf("LMER_piglets-Longitudinal_Significant_Genera.pdf", width = 12, height = 10)
+    for (i in seq_len(pages)) {
+      start_idx <- (i-1)*6 + 1
+      end_idx <- min(i*6, total_plots)
+      patchwork::wrap_plots(plots[start_idx:end_idx], ncol = 2) %>% print()
+    }
+    dev.off()
+    message("Saved multi-page PDF with ", total_plots, " plots (6 per page).")
+  } else {
+    message("No genera passed longitudinal FDR; no plots produced.")
+  }
+} else {
+  message("No predicted results available for plotting.")
+}
+
+
+## Sow microbiotas - assess timepoint only
+
+# --- Libraries ---
+library(phyloseq)
+library(microbiome)
+library(dplyr)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(ggplot2)
+library(patchwork)
+library(readr)
+
+# --- User parameters ---
+rds_path <- "ps_sow_feces_genus.rds"  # your input RDS
+prevalence_threshold <- 0.25        # keep genera present in >=25% of samples
+min_non_na <- 4                     # skip genera with too few data points
+fdr_cutoff <- 0.05
+
+# --- Step 1: Load and preprocess ---
+ps <- readRDS(rds_path)
+message("Loaded: ", rds_path)
+
+# Filter rare taxa
+ps_filtered <- ps %>%
+  filter_taxa(function(x){
+    prevalence <- sum(x > 0)/length(x)
+    mean_abundance <- mean(x/sum(x))
+    prevalence >= prevalence_threshold & mean_abundance >= 0.001
+  }, prune = TRUE)
+message("After filter_taxa -> taxa:", ntaxa(ps_filtered), " samples:", nsamples(ps_filtered))
+
+# Relative abundance
+ps_rel <- microbiome::transform(ps_filtered, "compositional")
+
+# Extract OTU + metadata
+otu <- as.data.frame(t(otu_table(ps_rel)))
+meta_data <- as(sample_data(ps_rel), "data.frame") %>%
+  filter(!is.na(timepoint), !is.na(animal_ID)) %>%
+  mutate(
+    timepoint = factor(timepoint, ordered = TRUE),
+    exp_group = factor(exp_group),
+    parity_groups_23_45_68 = as.factor(parity_groups_23_45_68),
+    sow_bcs = as.factor(sow_bcs),
+    sow_pregnancy_room = as.factor(sow_pregnancy_room),
+    animal_ID = factor(animal_ID)
+  )
+otu <- otu[rownames(meta_data), ]
+
+# Prevalence filter again
+prev_vec <- colMeans(otu > 0)
+keep_genera <- names(prev_vec)[prev_vec >= prevalence_threshold]
+otu <- otu[, keep_genera, drop=FALSE]
+message("Genera kept: ", ncol(otu))
+
+# --- Step 2: Run timepoint-only model ---
+results_rows <- list()
+genus_pvals <- list()
+skipped <- list()
+
+for (g in colnames(otu)) {
+  df <- data.frame(
+    Abundance = otu[[g]],
+    timepoint = meta_data$timepoint,
+    exp_group = meta_data$exp_group,
+    parity_groups_23_45_68 = meta_data$parity_groups_23_45_68,
+    sow_bcs = meta_data$sow_bcs,
+    sow_pregnancy_room = meta_data$sow_pregnancy_room,
+    animal_ID = meta_data$animal_ID
+  )
+  
+  if(sum(!is.na(df$Abundance)) < min_non_na){ skipped[[g]] <- "too_few"; next }
+  if(var(df$Abundance, na.rm=TRUE)==0){ skipped[[g]] <- "zero_variance"; next }
+  
+  # Model: timepoint + covariates + random animal_ID
+  fit <- tryCatch({
+    lmer(Abundance ~ timepoint + exp_group + parity_groups_23_45_68 + sow_bcs + sow_pregnancy_room + (1|animal_ID),
+         data=df, REML=TRUE,
+         control=lmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))
+  }, error=function(e) e)
+  if(inherits(fit,"error")){ skipped[[g]] <- paste("model_error:", fit$message); next }
+  
+  # Get predicted emmeans
+  # --- Step 2 modification for predicted means ---
+  # Instead of:
+  # emmeans(fit, ~ timepoint)
+   pred_df <- tryCatch({
+    as.data.frame(emmeans(fit, ~ timepoint | exp_group)) %>%
+      rename(estimate=emmean, SE=SE) %>%
+      mutate(Genus=g,
+             contrast=paste("timepoint", timepoint, sep=" | "))
+  }, error=function(e) NULL)
+  
+  if (is.null(pred_df)) next
+  
+  
+  # Get p-value for timepoint effect
+  a1 <- tryCatch(anova(fit, type=3), error=function(e) NULL)
+  p_val <- NA_real_
+  if(!is.null(a1)) {
+    ridx <- grep("timepoint", rownames(a1), ignore.case=TRUE)
+    if(length(ridx)>0) p_val <- as.numeric(a1[ridx,"Pr(>F)"])
+  }
+  
+  pred_df$timepoint_p <- p_val
+  results_rows[[g]] <- pred_df
+  genus_pvals[[g]] <- p_val
+}
+
+# Combine results
+predicted_df <- bind_rows(results_rows)
+genus_level <- tibble::tibble(
+  Genus=names(genus_pvals),
+  timepoint_p=as.numeric(unlist(genus_pvals))
+) %>%
+  mutate(timepoint_fdr = p.adjust(timepoint_p, method="BH"),
+         Significant = !is.na(timepoint_fdr) & timepoint_fdr<fdr_cutoff)
+
+# --- Step 3: Save results ---
+write_csv(predicted_df, "LMER_TimepointOnly_Sow_Predicted.csv")
+write_csv(genus_level, "LMER_TimepointOnly_Sow_Genus.csv")
+
+# --- Step 4: Plot significant genera (6 per page) ---
+sig_genera <- genus_level %>% filter(Significant) %>% pull(Genus)
+
+if(length(sig_genera)>0){
+  plots <- list()
+  for(g in sig_genera){
+    df_pred <- predicted_df %>% filter(Genus==g)
+    if(nrow(df_pred)==0) next
+    
+    p <- ggplot(df_pred, aes(x=timepoint, y=estimate, 
+                             color=exp_group, group=exp_group)) +
+      geom_point(size=3, position=position_dodge(0.25)) +
+      geom_line(position=position_dodge(0.25), size=1) +
+      geom_errorbar(aes(ymin=estimate-SE, ymax=estimate+SE),
+                    width=0.15, position=position_dodge(0.25)) +
+      scale_color_brewer(palette="Set2") +
+      labs(title=g, y="Predicted abundance (emmean ± SE)", x="Timepoint") +
+      theme_bw() +
+      theme(plot.title=element_text(face="bold", hjust=0.5),
+            legend.position="bottom")
+    
+    # append the plot to the list
+    plots[[g]] <- p
+  }
+  
+  if(length(plots) > 0){
+    pdf("LMER_TimepointOnly_Sow_Plots.pdf", width=14, height=10)
+    for(i in seq(1,length(plots),6)){
+      print(wrap_plots(plots[i:min(i+5,length(plots))], ncol=2))
+    }
+    dev.off()
+    message("Saved PDF: LMER_TimepointOnly_Sow_Plots.pdf")
+  }
+} else {
+  message("No significant genera to plot.")
+}
+```
+#Trajectory plots - piglets
+
+This utilizes a pre-prepared Excel table which has these columns:
+GENUS
+CP1 (q value for C vs P at timepoint 1)
+CT1 (q value for C vs T at timepoint 1)
+CP2 (and so on...)
+CT2
+CP3
+CT3
+Interaction (q value for expgroup * time interaction)
+
+```{r}
+# Load required libraries
+library(phyloseq)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(RColorBrewer)
+library(gridExtra)
+library(extrafont)
+library(systemfonts)
+
+# Only once, to use custom fonts - may require tweaking for your computer:
+#font_import()
+#fonts()
+loadfonts(device = "pdf")
+
+# Load microbiota data if needed
+ps <- readRDS("ps_pig_feces_GENUS.rds")
+
+# Convert to relative abundances 
+ps <- microbiome::transform(ps, "compositional")
+
+# Read the list of genera to be plotted from excel
+plotted_genera <- read_excel("trajectory-genera.xlsx")
+# Assuming the genera names are in the first column - adjust column name as needed
+genera_list <- plotted_genera[[1]]  # or use plotted_genera$genus_name if column is named
+
+# Read interaction q values if available
+interaction_qvalues <- tryCatch({
+  if("Interaction" %in% names(plotted_genera)) {
+    data.frame(
+      Genus = genera_list,
+      interaction_q = plotted_genera$Interaction,
+      stringsAsFactors = FALSE
+    ) %>%
+    dplyr::filter(!is.na(interaction_q) & interaction_q != "") %>%
+    dplyr::mutate(
+      # Format interaction q value using symbols
+      interaction_text = ifelse(interaction_q < 0.0001, "group:time ****", 
+                               ifelse(interaction_q < 0.001, "group:time ***",
+                                     ifelse(interaction_q < 0.01, "group:time **",
+                                           ifelse(interaction_q < 0.05, "group:time *",
+                                                 ifelse(interaction_q < 0.1, "group:time †", "")))))
+    ) %>%
+    dplyr::filter(interaction_text != "")
+  } else {
+    data.frame(Genus = character(0), interaction_q = numeric(0), interaction_text = character(0))
+  }
+}, error = function(e) {
+  data.frame(Genus = character(0), interaction_q = numeric(0), interaction_text = character(0))
+})
+
+# Read q values from the same Excel file (assuming it's in additional columns or sheets)
+# Try to read q values from the same file or a separate sheet/columns
+tryCatch({
+  # Q values in additional columns of the same sheet
+  q_values_df <- plotted_genera[, !names(plotted_genera) %in% names(plotted_genera)[1]]
+  
+  # Remove Interaction column if it exists
+  if("Interaction" %in% names(q_values_df)) {
+    q_values_df <- q_values_df[, !names(q_values_df) %in% "Interaction"]
+  }
+  
+  # Add genus names as row identifier
+  q_values_df$Genus <- genera_list
+  
+  # Convert to long format for easier handling
+  q_values_long <- q_values_df %>%
+    tidyr::pivot_longer(cols = -Genus, names_to = "comparison", values_to = "q_value") %>%
+    dplyr::filter(!is.na(q_value) & q_value != "") %>%  # Remove empty cells
+    dplyr::mutate(
+      # Extract experimental groups and timepoint from comparison name
+      exp_group1 = substr(comparison, 1, 1),
+      exp_group2 = substr(comparison, 2, 2),
+      timepoint = as.numeric(substr(comparison, 3, 3)),
+      # Format the q value for display using symbols
+      q_text = ifelse(q_value < 0.0001, "****", 
+                     ifelse(q_value < 0.001, "***",
+                           ifelse(q_value < 0.01, "**",
+                                 ifelse(q_value < 0.05, "*",
+                                       ifelse(q_value < 0.1, "†", ""))))),
+      # Create comparison label
+      comparison_label = paste0(exp_group1, "-", exp_group2, " ", q_text)
+    ) %>%
+    dplyr::filter(q_text != "")  # Only keep significant results
+}, error = function(e) {
+  # If q values can't be read, create empty dataframe
+  q_values_long <- data.frame(
+    Genus = character(0),
+    comparison = character(0),
+    q_value = numeric(0),
+    exp_group1 = character(0),
+    exp_group2 = character(0),
+    timepoint = numeric(0),
+    q_text = character(0),
+    comparison_label = character(0)
+  )
+  message("No q values found or error reading q values")
+})
+
+# Convert phyloseq object to data frame
+
+ps_df <- psmelt(ps)
+
+# Filter for selected genera
+ps_filtered <- ps_df %>%
+  dplyr::filter(Genus %in% genera_list)  # Adjust 'Genus' to match your taxonomy column name
+
+# Calculate median and IQR for each genus, experimental group, and timepoint
+summary_df <- ps_filtered %>%
+  dplyr::group_by(Genus, exp_group, timepoint) %>%
+  dplyr::summarise(
+    median = median(Abundance, na.rm = TRUE),
+    q25 = quantile(Abundance, 0.25, na.rm = TRUE),
+    q75 = quantile(Abundance, 0.75, na.rm = TRUE),
+    n = n(),
+    .groups = 'drop'
+  )
+
+# Create trajectory plots for each genus
+plots <- list()
+
+for(g in genera_list) {
+  # Filter data for current genus
+  df <- summary_df %>% dplyr::filter(Genus == g)
+  
+  # Create title text
+  title_text <- paste("Trajectory of", g)
+  
+  # Create FDR label (you can modify this based on your statistical analysis)
+  fdr_label <- ""  # Add your FDR analysis results here if needed
+  
+  # Create the plot
+  p <- ggplot(df, aes(x = timepoint, y = median, color = exp_group, group = exp_group)) +
+    geom_line(position = position_dodge(width = 0.25), size = 0.5, linetype = "dotdash", alpha=0.3) +
+    geom_point(size = 3, position = position_dodge(width = 0.25)) +
+    geom_errorbar(aes(ymin = q25, ymax = q75),
+                  width = 0.15, position = position_dodge(width = 0.25)) +
+    scale_color_manual(values = c("C" = "#785ef0", "P" = "#ffb000", "T" = "#fe6100")) +
+    labs(title = title_text, y = "Relative abundance (median ± IQR) %", x = "Timepoint") +
+    theme_bw() +
+    theme(plot.title = element_text(face = "italic", hjust = 0.5, family = "Arial Narrow"),
+          legend.position = "bottom", strip.text = element_text(face = "italic", size = 10, family = "Arial Narrow"))
+  
+  plots[[g]] <- p
+}
+
+# Create a panel with all plots using facet_wrap
+combined_plot <- summary_df %>%
+  ggplot(aes(x = timepoint, y = median, color = exp_group, group = exp_group)) +
+  geom_line(position = position_dodge(width = 0.25), size = 0.5, linetype="solid", alpha=0.3) +
+  geom_point(size = 2, position = position_dodge(width = 0.25)) +
+  geom_errorbar(aes(ymin = q25, ymax = q75),
+                width = 0.15, position = position_dodge(width = 0.25)) +
+  scale_color_manual(values = c("C" = "#785ef0", "P" = "#ffb000", "T" = "#fe6100")) +
+  labs(y = "Relative abundance (median ± IQR) %", x = "Timepoint") +
+  scale_x_continuous(breaks = c(1, 2, 3)) +
+  scale_y_continuous(labels = function(x) x * 100) +
+  facet_wrap(~ Genus, scales = "free_y", ncol = 5) +  # 5 plots per row
+  theme_bw() +
+  theme(plot.title = element_text(face = "italic", hjust = 0.5, family = "Arial Narrow"),
+        legend.position = "bottom",
+        strip.text = element_text(face = "italic", size = 10, family = "Arial Narrow", margin = margin(t = 2, b = 2)),
+        axis.text = element_text(size = 7, family = "Arial Narrow"),
+        axis.title = element_text(size = 9, family = "Arial Narrow"),
+        legend.text = element_text(size = 8, family = "Arial Narrow"),
+        legend.title = element_text(family = "Arial Narrow"),
+        panel.spacing.x = unit(0.1, "lines"),
+        panel.spacing.y = unit(0.4, "lines"),
+        text = element_text(family = "Arial Narrow"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank())
+
+# Add q value annotations if available
+if(nrow(q_values_long) > 0) {
+  # Since we're using scales="free_y", we need to add annotations per facet
+  # Let's try adding them to the original summary_df and use geom_text directly
+  
+  # Merge q_values with summary_df to get per-facet positioning
+  summary_with_annotations <- summary_df %>%
+    dplyr::left_join(
+      q_values_long %>% dplyr::select(Genus, timepoint, comparison_label), 
+      by = c("Genus", "timepoint")
+    ) %>%
+    dplyr::group_by(Genus) %>%
+    dplyr::mutate(
+      # Calculate max for this specific genus
+      genus_max = max(q75, na.rm = TRUE),
+      # Position annotation just above the max for this genus
+      annotation_y = ifelse(!is.na(comparison_label), 
+                           genus_max * 1.1, 
+                           NA)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::filter(!is.na(comparison_label))
+  
+  # Debug: Print sample of data
+  cat("Sample annotation data:\n")
+  print(head(summary_with_annotations[c("Genus", "timepoint", "genus_max", "annotation_y", "comparison_label")]))
+  
+  # Add annotations using the merged data
+  if(nrow(summary_with_annotations) > 0) {
+    # Remove duplicates to avoid multiple identical labels
+    unique_annotations <- summary_with_annotations %>%
+      dplyr::distinct(Genus, timepoint, comparison_label, annotation_y, .keep_all = TRUE)
+    
+    combined_plot <- combined_plot +
+      geom_text(data = unique_annotations,
+                aes(x = timepoint, y = annotation_y, label = comparison_label),
+                inherit.aes = FALSE,
+                size = 3,
+                family = "Arial Narrow",
+                hjust = 0.5,
+                color = "black")
+  }
+}
+
+# Add interaction q values if available (top left corner)
+if(nrow(interaction_qvalues) > 0) {
+  combined_plot <- combined_plot +
+    geom_text(data = interaction_qvalues,
+              aes(x = 1, y = Inf, label = interaction_text),
+              inherit.aes = FALSE,
+              size = 3,
+              family = "Arial Narrow",
+              hjust = 0,
+              vjust = 1.2,
+              color = "black")
+}
+
+# Display the combined plot
+print(combined_plot)
+
+
+# Save the plot as PDF (Vertical A4 format)
+ggsave("genera_trajectory_plots.pdf", combined_plot, 
+       width = 210, height = 200, units = "mm", dpi = 300, device=pdf)
+
+# This may produce a more editable PDF:
+library(Cairo)
+cairo_pdf("genera_trajectory_plots-cairo.pdf", width = 8.27, height = 11.69, family = "Arial")
+print(combined_plot)
+dev.off()
+
+
+```
+#Plotting growth associations
+
+```{r}
+
+library("tibble")
+
+# Load data if necessary
+ps <- readRDS("ps_pig_feces_genus.rds")
+
+# Select one timepoint
+pigs_select <- subset_samples(ps,timepoint == 3)
+
+# Prepare metadata
+meta_data_ADG <- data.frame(sample_data(pigs_select)) %>%
+  rownames_to_column("ID")
+
+# Convert to relative abundances and LOG transform
+pigs_rel <- microbiome::transform(pigs_select,"compositional")
+pigs_log10 <- microbiome::transform(pigs_select,"log10")
+pigs_log2 <- transform_sample_counts(pigs_rel, function(x) log2(x + 0.0001))
+
+############
+# Plot with relabunds
+############
+
+# Select taxon to be plotted and set output file names
+taxon <- "Oliverpabstia"
+file_prefix <- "ADG-wean_end-vs-"
+file_suffix <- "-at-tp3.pdf"
+
+#Select the interesting taxa
+  otutable <- data.frame(otu_table(pigs_rel)) %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column("ID")
+
+combo_table <- dplyr::full_join(meta_data_ADG,otutable)
+
+# Plot
+library(ggplot2)
+library(scales)
+
+
+# Plot only one trendline
+ggplot(combo_table, aes(x=!!sym(taxon), y=piglet_ADG_wean_end)) + geom_point(aes(colour=exp_group)) + geom_smooth(method="loess", span=1.0, aes(colour="darkgrey"))+
+    scale_color_manual(values = c("C" = "#785ef0", 
+                                "P" = "#ffb000", 
+                                "T" = "#fe6100"))+
+    theme_minimal()+
+   theme(axis.title.x = element_text(face = "italic"))
+ # scale_x_continuous(labels = percent_format())  # Formats x-axis as percentages 
+
+ggsave(filename=paste(file_prefix,taxon,"-relabund_oneline-loess",file_suffix,sep=""), device="pdf", width=15, height=10, units="cm")
+
+
+# Plot trendlines for each experimental group
+ggplot(combo_table, aes(x=!!sym(taxon), y=piglet_ADG_wean_end, colour=exp_group)) + geom_point() + geom_smooth(method="loess", span=2)+
+    scale_color_manual(values = c("C" = "#785ef0", 
+                                "P" = "#ffb000", 
+                                "T" = "#fe6100"))+
+    theme_minimal()+
+  scale_x_continuous(labels = percent_format())  # Formats x-axis as percentages
+
+ggsave(filename=paste(file_prefix,taxon,"-relabund-loess",file_suffix,sep=""), device="pdf", width=15, height=10, units="cm")
+
+
+```
+
+
+`
